@@ -11,6 +11,19 @@ import (
 	"github.com/mattermost/mattermost-server/v5/model"
 )
 
+var moderatedPermissions map[string]bool
+
+func init() {
+	moderatedPermissions = map[string]bool{
+		model.PERMISSION_ADD_REACTION.Id:                   true,
+		model.PERMISSION_REMOVE_REACTION.Id:                true,
+		model.PERMISSION_CREATE_POST.Id:                    true,
+		model.PERMISSION_MANAGE_PUBLIC_CHANNEL_MEMBERS.Id:  true,
+		model.PERMISSION_MANAGE_PRIVATE_CHANNEL_MEMBERS.Id: true,
+		// model.PERMISSION_USE_CHANNEL_MENTIONS:              true,
+	}
+}
+
 func (a *App) MakePermissionError(permission *model.Permission) *model.AppError {
 	return model.NewAppError("Permissions", "api.context.permissions.app_error", nil, "userId="+a.Session.UserId+", "+"permission="+permission.Id, http.StatusForbidden)
 }
@@ -45,7 +58,7 @@ func (a *App) SessionHasPermissionToChannel(session model.Session, channelId str
 	if err == nil {
 		if roles, ok := ids[channelId]; ok {
 			channelRoles = strings.Fields(roles)
-			if a.RolesGrantPermission(channelRoles, permission.Id) {
+			if a.ChannelRolesGrantPermission(channelRoles, permission.Id, channelId) {
 				return true
 			}
 		}
@@ -195,6 +208,48 @@ func (a *App) RolesGrantPermission(roleNames []string, permissionId string) bool
 		return false
 	}
 
+	return rolesPermitPermission(roles, permissionId)
+}
+
+func (a *App) ChannelRolesGrantPermission(roleNames []string, permissionID, channelID string) bool {
+	// If the permission is moderated (i.e. meant to be controlled by the channel scheme) then use the normal
+	// permissions logic.
+	if _, ok := moderatedPermissions[permissionID]; ok {
+		return a.RolesGrantPermission(roleNames, permissionID)
+	}
+
+	// Get the channel for the team id.
+	channel, err := a.Srv.Store.Channel().Get(channelID, true)
+	if err != nil {
+		return false
+	}
+
+	// Get the team for the team scheme id.
+	team, err := a.Srv.Store.Team().Get(channel.TeamId)
+	if err != nil {
+		return false
+	}
+
+	// Determine which higher-scoped scheme to use, namely the system scheme or the team scheme.
+	if team.SchemeId == nil {
+		roleNames = []string{model.CHANNEL_GUEST_ROLE_ID, model.CHANNEL_USER_ROLE_ID, model.CHANNEL_ADMIN_ROLE_ID}
+	} else {
+		scheme, err := a.Srv.Store.Scheme().Get(*team.SchemeId)
+		if err != nil {
+			return false
+		}
+		roleNames = []string{scheme.DefaultChannelGuestRole, scheme.DefaultChannelUserRole, scheme.DefaultChannelAdminRole}
+	}
+
+	roles, err := a.Srv.Store.Role().GetByNames(roleNames)
+	if err != nil {
+		return false
+	}
+
+	return rolesPermitPermission(roles, permissionID)
+}
+
+func rolesPermitPermission(roles []*model.Role, permissionID string) bool {
 	for _, role := range roles {
 		if role.DeleteAt != 0 {
 			continue
@@ -202,7 +257,7 @@ func (a *App) RolesGrantPermission(roleNames []string, permissionId string) bool
 
 		permissions := role.Permissions
 		for _, permission := range permissions {
-			if permission == permissionId {
+			if permission == permissionID {
 				return true
 			}
 		}
